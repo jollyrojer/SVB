@@ -1,0 +1,157 @@
+application:
+  configuration:
+    input.os: { image: "us-east-1/ami-7a661812", identity: "root", type: "linux"   }
+    input.instance-size: "m1.xlarge"
+    input.instance-prefix: "Coherence"
+    input.cluster-name: "CohCluster-0"
+    input.quantity: 3
+    
+  bindings:
+    - [coherence.workflow, WLConsole ]
+  
+  interfaces:
+    input:
+      os: "bind(coherence.workflow#input.os, WLConsole#input.os)"
+      instance-size: "bind(coherence.workflow#input.instance-size)"
+      instance-prefix: "bind(coherence.workflow#input.instance-prefix)"
+      cluster-name: "bind(coherence.workflow#input.cluster-name)"
+      quantity: "bind(coherence.workflow#input.quantity)"
+    output:
+      coherence-nodes: "bind(coherence.workflow#result.coh-hosts)"
+      coherence-servers: "bind(coherence.workflow#result.coh-servers)"
+  
+  components:
+    coherence:
+      components:
+        workflow: # = coherence.components.workflow
+          type: workflow.Instance
+          interfaces:
+            input:
+              os:
+                type: "configuration(map<string,object>)"
+                name: "OS type"
+                suggestions:
+                  "CentOS-6.5":          { image: "us-east-1/ami-ee698586", identity: "root",          type: "linux"   }
+                  "RHEL-5.11":           { image: "us-east-1/ami-7a661812", identity: "root",          type: "linux"   }
+              instance-size: { type: configuration(string), name: "EC2 instance size" }
+              instance-prefix: { type: configuration(string), name: "AWS tag prefix" }
+              cluster-name: { type: configuration(string), name: "Coherence Cluster name" }
+              quantity: { type: configuration(int), name: "Number of Coherence nodes in cluster"}
+              recipe-url: { type: configuration(string), name: "Recipe URL" }
+            wl-actions:
+              deploy-wl-node:
+                name: Deploy Weblogic node
+                type: send-command(list<string> wl-node-ip, string wl-node-identity  => list<string> wl-nodes )
+              create-coh-server:
+                type: send-command(list<string> wl-nodes => list<string> coh-servers)
+            result:
+              coh-hosts: { type: publish-signal(list<string>), name: "Coherence hosts" }
+              coh-servers: { type: publish-signal(list<string>), name: "Coherence servers"} 
+          required: [wl-actions]
+          configuration:
+            input.recipe-url: "https://dl.dropboxusercontent.com/u/250836/weblogic.tar.gz"
+            configuration.workflows:
+              launch:
+                steps:
+                  - launch-vm:
+                      action: provisionVms
+                      parameters:
+                        hardwareId: "{$.instance-size}"
+                        imageId: "{$.os.image}"
+                        vmIdentity: "{$.os.identity}"
+                        jcloudsNodeNamePrefix: "{$.instance-prefix}"
+                        targetQuantity: "{$.quantity}"
+                        roleName: "default"
+                      output:
+                        coh-hosts: ips
+                  - get-hostname:
+                      action: execrun
+                      precedingPhases: [ launch-vm ]
+                      parameters:
+                        roles: [ default ]
+                        isSudo: true
+                        command:
+                          - curl -s http://169.254.169.254/latest/meta-data/public-hostname
+                      output:
+                        wl-nodes-dns: stdout
+                  - mount-storage:
+                      action: execrun
+                      precedingPhases: [launch-vm]
+                      parameters:
+                        roles: [ default ]
+                        isSudo: true
+                        command:
+                          - |
+                            mkdir -p /opt
+                            mount | grep /opt || mount `curl -s http://169.254.169.254/latest/meta-data/block-device-mapping/ephemeral0 | tr 'a-d' 'e-h' | sed 's#^..#/dev/sd#'` /opt
+                  - deploy-wl-nodes:
+                      action: wl-actions.deploy-wl-node
+                      precedingPhases: [mount-storage, get-hostname]
+                      parameters:
+                        commandCallTimeout: 20 minutes
+                        wl-node-ip: "{$.wl-nodes-dns[*]}"
+                        wl-node-identity: "{$.os.identity}"
+                      output:
+                        wl-nodes: wl-nodes
+                  - create-wka-config:
+                      action: chefsolo
+                      precedingPhases: [deploy-wl-nodes]
+                      parameters:
+                        #isSudo: false
+                        isSudo: true
+                        roles: [ default ]
+                        recipeUrl: "{$.recipe-url}"
+                        runList: ["recipe[weblogic::create_wka]"]
+                        version: 11.16.4-1
+                        jattrs:
+                          weblogic:
+                            coh_server:
+                              unicast_address: "{$.wl-nodes-dns[*]}"
+                  - create-coh-servers:
+                      action: wl-actions.create-coh-server
+                      precedingPhases: [create-wka-config]
+                      parameters:
+                        commandCallTimeout: 5 minutes
+                        wl-nodes: "{$.wl-nodes}"
+                      output:
+                        coh-servers: coh-servers
+                return:
+                  coh-hosts: 
+                    value: "{$.wl-nodes-dns[*]}"
+                  coh-servers:
+                    value: "{$.coh-servers}"
+    WLConsole:
+      type: reference.Submodule
+      configuration:
+        __locator.application-id: "WLConsole"
+      interfaces:
+        input:
+          os:                     
+            type: "configuration(map<string,object>)"
+            name: "OS type"
+            suggestions:
+              "CentOS-6.5":          { image: "us-east-1/ami-ee698586", identity: "root",          type: "linux"   }
+              "RHEL-5.11":           { image: "us-east-1/ami-7a661812", identity: "root",          type: "linux"   }
+          windows-password:       { type: configuration(string), name: "Windows administrator password"   }
+          instance-size:          { type: configuration(string), name: "EC2 instance size"                }
+        wl-actions:
+          deploy-wl-node:
+            name: Deploy Weblogic node
+            type: receive-command(list<string> wl-node-ip, string wl-node-identity  => list<string> wl-nodes )
+            arguments:
+              wl-node-ip: 
+                name: Node IP
+              wl-node-identity:
+                name: Node user
+            results:
+              wl-nodes: 
+                name: Enabled Weblogic Nodes
+          create-coh-server:
+            name: Create Coherence server
+            type: receive-command(list<string> wl-nodes => list<string> coh-servers)
+            arguments:
+              wl-nodes: 
+                name: Weblogic Nodes
+            results:
+              coh-servers:
+                name: Coherence Servers
